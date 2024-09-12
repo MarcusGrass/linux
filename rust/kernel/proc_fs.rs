@@ -3,14 +3,21 @@
 
 use crate::types::Opaque;
 
+use kernel::error::Result;
+
 /// Proc options
 pub struct ProcOps(Opaque<bindings::proc_ops>);
 
-/// A proc directory entry, currently uninstantiable/unimplemented.
-///
-/// Consequences are that files can only be created under `/proc`, and no subdirectories, as of
-/// now.
-pub struct ProcDirEntry(Opaque<bindings::proc_dir_entry>);
+/// A proc directory entry.
+pub struct ProcDirEntry(*mut bindings::proc_dir_entry);
+
+impl Drop for ProcDirEntry {
+    fn drop(&mut self) {
+        unsafe {
+            bindings::proc_remove(self.0);
+        }
+    }
+}
 
 /// Create a proc entry with the filename `name`
 pub fn proc_create(
@@ -18,17 +25,16 @@ pub fn proc_create(
     mode: bindings::umode_t,
     dir_entry: Option<&ProcDirEntry>,
     proc_ops: &ProcOps,
-) -> kernel::prelude::Result<()> {
-    unsafe {
-        let dir_ent = dir_entry
-            .map(|de| de.0.get())
-            .unwrap_or_else(core::ptr::null_mut);
+) -> Result<ProcDirEntry> {
+    let pde = unsafe {
+        let dir_ent = dir_entry.map(|de| de.0).unwrap_or_else(core::ptr::null_mut);
         bindings::proc_create(
             name.as_ptr() as *const core::ffi::c_char,
             mode,
             dir_ent,
             proc_ops.0.get(),
-        );
-    }
-    Ok(())
+        )
+    };
+    let pde = ProcDirEntry(pde);
+    Ok(pde)
 }

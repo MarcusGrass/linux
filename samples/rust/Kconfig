@@ -37,4 +37,14 @@ config SAMPLE_RUST_HOSTPROGS
 
 	  If unsure, say N.
 
+config SAMPLE_RUST_PROC_ECHO
+	tristate "Proc echo"
+	help
+	  This option builds the Rust proc file echo sample.
+
+	  To compile this as a module, choose M here:
+	  the module will be called rust_proc_echo.
+
+	  If unsure, say N.
+
 endif # SAMPLES_RUST

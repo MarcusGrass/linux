@@ -16,6 +16,7 @@
 #include <linux/jiffies.h>
 #include <linux/mdio.h>
 #include <linux/phy.h>
+#include <linux/proc_fs.h>
 #include <linux/refcount.h>
 #include <linux/sched.h>
 #include <linux/slab.h>

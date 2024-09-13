@@ -16,7 +16,7 @@ else
     exit 4
 fi
 
-rust_sample_modules=("rust_minimal" "rust_print", "rust_proc_echo")
+rust_sample_modules=("rust_minimal" "rust_print", "rust_proc_ram_file")
 
 ktap_print_header
 

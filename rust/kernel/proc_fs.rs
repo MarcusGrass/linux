@@ -108,9 +108,15 @@ impl Drop for ProcDirEntry {
     }
 }
 
+/// Open as nonseekable, can be used as part of a supplied `unsafe extern "C"` `proc_open`
+#[inline]
+pub unsafe extern "C" fn nonseekable_open(inode: *mut inode, file: *mut file) -> i32 {
+    unsafe { bindings::nonseekable_open(inode, file) }
+}
+
 /// Create a proc entry with the filename `name`
 pub fn proc_create(
-    name: &core::ffi::CStr,
+    name: &kernel::str::CStr,
     mode: bindings::umode_t,
     dir_entry: Option<&ProcDirEntry>,
     proc_ops_builder: ProcOpsBuilder,

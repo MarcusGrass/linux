@@ -2,6 +2,6 @@
 
 obj-$(CONFIG_SAMPLE_RUST_MINIMAL)		+= rust_minimal.o
 obj-$(CONFIG_SAMPLE_RUST_PRINT)			+= rust_print.o
-obj-$(CONFIG_SAMPLE_RUST_PROC)			+= rust_proc_echo.o
+obj-$(CONFIG_SAMPLE_RUST_PROC_RAM_FILE)		+= rust_proc_ram_file.o
 
 subdir-$(CONFIG_SAMPLE_RUST_HOSTPROGS)		+= hostprogs

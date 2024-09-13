@@ -37,13 +37,13 @@ config SAMPLE_RUST_HOSTPROGS
 
 	  If unsure, say N.
 
-config SAMPLE_RUST_PROC_ECHO
-	tristate "Proc echo"
+config SAMPLE_RUST_PROC_RAM_FILE
+	tristate "Proc ram file"
 	help
-	  This option builds the Rust proc file echo sample.
+	  This option builds the Rust proc ram file sample.
 
 	  To compile this as a module, choose M here:
-	  the module will be called rust_proc_echo.
+	  the module will be called rust_proc_ram_file.
 
 	  If unsure, say N.
 

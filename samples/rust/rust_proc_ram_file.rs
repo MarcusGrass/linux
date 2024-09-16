@@ -58,23 +58,18 @@ impl SharedRamFile {
     }
 
     fn write(&self, user: UserSlice, offset: usize) -> Result<usize> {
-        let mut buf = user.reader();
+        let buf = user.reader();
         let len = buf.len();
         if !INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
-            pr_info!("Try write uninit, {len} bytes\n");
             return Err(EBUSY);
         }
-        pr_info!("Write is init\n");
         let data = unsafe { self.data.get().as_ref().unwrap() };
         let Some(data_present) = data else {
-            pr_info!("Try read uninit data, {len} bytes\n");
             return Err(EBUSY);
         };
-        pr_info!("Write data is present\n");
         let mut shared_ram = data_present.lock();
 
         let Some(inner) = shared_ram.as_mut() else {
-            pr_info!("Try write empty, {len} bytes\n");
             return Err(EBUSY);
         };
         pr_info!("Wants write {len} bytes, offset={offset}\n");
@@ -87,12 +82,13 @@ impl SharedRamFile {
                 cur.capacity(),
                 cur.len(),
             );
+            cur.clear();
             cur.reserve(len, GFP_KERNEL)?;
             pr_info!(
                 "Reserved {len} bytes for write, cur vec at: {:p}\n",
                 cur.as_ptr()
             );
-            buf.read_slice(&mut cur.as_mut_slice()[..len])?;
+            buf.read_all(cur, GFP_KERNEL)?;
             pr_info!(
                 "Wrote {len} bytes from start, currently has {} bytes\n",
                 cur.len()
@@ -113,22 +109,17 @@ impl SharedRamFile {
     fn read(&self, buf: UserSlice, offset: usize) -> Result<(usize, usize)> {
         let mut buf = buf.writer();
         if !INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
-            pr_info!("Try read uninit, {} bytes\n", buf.len());
             return Err(EBUSY);
         }
-        pr_info!("Read is init\n");
         let data = unsafe { self.data.get().as_ref().unwrap() };
         let Some(data_present) = data else {
-            pr_info!("Try read uninit data, {} bytes\n", buf.len());
             return Err(EBUSY);
         };
-        pr_info!("Read is present\n");
         let shared_ram = data_present.lock();
         let Some(inner) = shared_ram.as_ref() else {
-            pr_info!("Try read empty, {} bytes\n", buf.len());
             return Err(EBUSY);
         };
-        pr_info!("Wants read max {} bytes\n", buf.len());
+        pr_info!("Wants read max {} bytes at offset={offset}\n", buf.len());
         let cur: &[u8] = inner.buf.as_slice();
         let Some(wants_section) = cur.get(offset..) else {
             // EOF
@@ -190,7 +181,6 @@ unsafe extern "C" fn proc_open(
     inode: *mut kernel::bindings::inode,
     file: *mut kernel::bindings::file,
 ) -> i32 {
-    pr_info!("Proc open");
     unsafe { kernel::proc_fs::nonseekable_open(inode, file) }
 }
 
@@ -200,7 +190,6 @@ unsafe extern "C" fn proc_read(
     buf_cap: usize,
     read_offset: *mut kernel::bindings::loff_t,
 ) -> isize {
-    pr_info!("Got read");
     let buf = buf as *mut u8 as usize;
     let buf_ref = UserSlice::new(buf, buf_cap);
     let offset = unsafe {
@@ -239,7 +228,6 @@ unsafe extern "C" fn proc_write(
     write_offset: *mut kernel::bindings::loff_t,
 ) -> isize {
     let buf = buf as *const u8 as usize;
-    pr_info!("Input buf at {buf:x}");
     let user_buf = UserSlice::new(buf, buf_cap);
     let offset = unsafe {
         let Some(offset_ref) = write_offset.as_mut() else {

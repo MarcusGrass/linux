@@ -1,7 +1,7 @@
 //! Implementation of proc_fs functionality
 //!
 
-use core::option::Option;
+use core::{option::Option, ptr};
 
 use bindings::{file, inode, loff_t};
 
@@ -79,8 +79,9 @@ impl ProcOpsBuilder {
         self
     }
 
-    const fn into_proc_ops(self) -> bindings::proc_ops {
-        bindings::proc_ops {
+    /// Construct a usable ProcOps-wrapper
+    pub const fn into_proc_ops(self) -> ProcOps {
+        ProcOps(bindings::proc_ops {
             proc_flags: self.flags,
             proc_open: self.proc_open,
             proc_read: self.proc_read,
@@ -93,17 +94,23 @@ impl ProcOpsBuilder {
             proc_compat_ioctl: None,
             proc_mmap: None,
             proc_get_unmapped_area: None,
-        }
+        })
     }
 }
 
-/// A proc directory entry.
-pub struct ProcDirEntry(core::ptr::NonNull<bindings::proc_dir_entry>);
+/// Usable wrapper for proc ops
+pub struct ProcOps(bindings::proc_ops);
 
-impl Drop for ProcDirEntry {
+/// A proc directory entry.
+pub struct ProcDirEntry<'a> {
+    ptr: core::ptr::NonNull<bindings::proc_dir_entry>,
+    _pd: core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Drop for ProcDirEntry<'a> {
     fn drop(&mut self) {
         unsafe {
-            bindings::proc_remove(self.0.as_ptr());
+            bindings::proc_remove(self.ptr.as_ptr());
         }
     }
 }
@@ -115,26 +122,29 @@ pub unsafe extern "C" fn nonseekable_open(inode: *mut inode, file: *mut file) ->
 }
 
 /// Create a proc entry with the filename `name`
-pub fn proc_create(
-    name: &kernel::str::CStr,
+pub fn proc_create<'a>(
+    name: &'static kernel::str::CStr,
     mode: bindings::umode_t,
-    dir_entry: Option<&ProcDirEntry>,
-    proc_ops_builder: ProcOpsBuilder,
-) -> Result<ProcDirEntry> {
-    let pops = proc_ops_builder.into_proc_ops();
+    dir_entry: Option<&ProcDirEntry<'a>>,
+    proc_ops: &'a ProcOps,
+) -> Result<ProcDirEntry<'a>> {
+    let pops = core::ptr::addr_of!(proc_ops.0);
     let pde = unsafe {
         let dir_ent = dir_entry
-            .map(|de| de.0.as_ptr())
+            .map(|de| de.ptr.as_ptr())
             .unwrap_or_else(core::ptr::null_mut);
         bindings::proc_create(
             name.as_ptr() as *const core::ffi::c_char,
             mode,
             dir_ent,
-            core::ptr::addr_of!(pops),
+            pops,
         )
     };
     match core::ptr::NonNull::new(pde) {
         None => Err(ENOMEM),
-        Some(nn) => Ok(ProcDirEntry(nn)),
+        Some(nn) => Ok(ProcDirEntry {
+            ptr: nn,
+            _pd: core::marker::PhantomData::default(),
+        }),
     }
 }

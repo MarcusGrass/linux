@@ -1,13 +1,13 @@
 //! Implementation of proc_fs functionality
 //!
 
-use core::{option::Option, ptr};
+use core::option::Option;
 
 use bindings::{file, inode, loff_t};
 
 use kernel::error::Result;
 
-use crate::prelude::ENOMEM;
+use crate::prelude::{EINVAL, ENOMEM};
 
 /// Proc options builder
 pub struct ProcOpsBuilder {
@@ -29,6 +29,33 @@ pub struct ProcOpsBuilder {
             arg4: *mut loff_t,
         ) -> isize,
     >,
+    proc_lseek: Option<
+        unsafe extern "C" fn(arg1: *mut file, arg2: loff_t, arg3: core::ffi::c_int) -> loff_t,
+    >,
+}
+
+#[repr(u32)]
+pub enum Whence {
+    SeekSet = kernel::bindings::SEEK_SET,
+    SeekCur = kernel::bindings::SEEK_CUR,
+    SeekEnd = kernel::bindings::SEEK_END,
+    SeekData = kernel::bindings::SEEK_DATA,
+    SeekHole = kernel::bindings::SEEK_HOLE,
+}
+
+impl TryFrom<u32> for Whence {
+    type Error = kernel::error::Error;
+
+    fn try_from(value: u32) -> core::result::Result<Self, Self::Error> {
+        Ok(match value {
+            kernel::bindings::SEEK_SET => Self::SeekSet,
+            kernel::bindings::SEEK_CUR => Self::SeekCur,
+            kernel::bindings::SEEK_END => Self::SeekEnd,
+            kernel::bindings::SEEK_DATA => Self::SeekData,
+            kernel::bindings::SEEK_HOLE => Self::SeekHole,
+            _ => return Err(EINVAL),
+        })
+    }
 }
 
 impl ProcOpsBuilder {
@@ -39,7 +66,13 @@ impl ProcOpsBuilder {
             proc_open: None,
             proc_read: None,
             proc_write: None,
+            proc_lseek: None,
         }
+    }
+
+    pub const fn nonseekable_open(mut self) -> Self {
+        self.proc_open = Some(nonseekable_open);
+        self
     }
 
     /// Add an on-open callback
@@ -79,6 +112,14 @@ impl ProcOpsBuilder {
         self
     }
 
+    pub const fn with_lseek(
+        mut self,
+        func: unsafe extern "C" fn(arg1: *mut file, arg2: loff_t, arg3: core::ffi::c_int) -> loff_t,
+    ) -> Self {
+        self.proc_lseek = Some(func);
+        self
+    }
+
     /// Construct a usable ProcOps-wrapper
     pub const fn into_proc_ops(self) -> ProcOps {
         ProcOps(bindings::proc_ops {
@@ -87,7 +128,7 @@ impl ProcOpsBuilder {
             proc_read: self.proc_read,
             proc_read_iter: None,
             proc_write: self.proc_write,
-            proc_lseek: None,
+            proc_lseek: self.proc_lseek,
             proc_release: None,
             proc_poll: None,
             proc_ioctl: None,

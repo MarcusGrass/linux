@@ -11,8 +11,11 @@ use core::{
 use kernel::{
     c_str,
     prelude::*,
-    proc_fs::{proc_create, ProcDirEntry, ProcOps, ProcOpsBuilder},
-    sync::Mutex,
+    proc_fs::{proc_create, ProcDirEntry, ProcOps, ProcOpsBuilder, Whence},
+    sync::{
+        lock::{mutex::MutexBackend, Guard},
+        Mutex,
+    },
     uaccess::UserSlice,
 };
 
@@ -58,20 +61,12 @@ impl SharedRamFile {
     }
 
     fn write(&self, user: UserSlice, offset: usize) -> Result<usize> {
-        let buf = user.reader();
-        let len = buf.len();
-        if !INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
-            return Err(EBUSY);
-        }
-        let data = unsafe { self.data.get().as_ref().unwrap() };
-        let Some(data_present) = data else {
-            return Err(EBUSY);
-        };
-        let mut shared_ram = data_present.lock();
-
+        let mut shared_ram = self.lock_buf_inner()?;
         let Some(inner) = shared_ram.as_mut() else {
             return Err(EBUSY);
         };
+        let buf = user.reader();
+        let len = buf.len();
         pr_info!("Wants write {len} bytes, offset={offset}\n");
 
         let cur: &mut alloc::vec::Vec<u8> = &mut inner.buf;
@@ -107,18 +102,11 @@ impl SharedRamFile {
     }
 
     fn read(&self, buf: UserSlice, offset: usize) -> Result<(usize, usize)> {
-        let mut buf = buf.writer();
-        if !INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
-            return Err(EBUSY);
-        }
-        let data = unsafe { self.data.get().as_ref().unwrap() };
-        let Some(data_present) = data else {
-            return Err(EBUSY);
-        };
-        let shared_ram = data_present.lock();
+        let shared_ram = self.lock_buf_inner()?;
         let Some(inner) = shared_ram.as_ref() else {
             return Err(EBUSY);
         };
+        let mut buf = buf.writer();
         pr_info!("Wants read max {} bytes at offset={offset}\n", buf.len());
         let cur: &[u8] = inner.buf.as_slice();
         let Some(wants_section) = cur.get(offset..) else {
@@ -133,6 +121,65 @@ impl SharedRamFile {
             Ok((buf.len(), offset + buf.len()))
         }
     }
+
+    fn lseek(
+        &self,
+        cur_offset: kernel::bindings::loff_t,
+        offset: kernel::bindings::loff_t,
+        whence: Whence,
+    ) -> Result<usize> {
+        let shared_ram = self.lock_buf_inner()?;
+        let Some(inner): Option<&SharedRamInnner> = shared_ram.as_ref() else {
+            return Err(EBUSY);
+        };
+        match whence {
+            Whence::SeekSet | Whence::SeekData => {
+                let Ok(offset) = usize::try_from(offset) else {
+                    return Err(EINVAL);
+                };
+                if inner.buf.len() >= offset {
+                    Ok(offset)
+                } else {
+                    Err(EINVAL)
+                }
+            }
+            Whence::SeekCur => {
+                let Ok(offset) = usize::try_from(cur_offset + offset) else {
+                    return Err(EINVAL);
+                };
+                if inner.buf.len() >= offset {
+                    Ok(offset)
+                } else {
+                    Err(EINVAL)
+                }
+            }
+            Whence::SeekEnd => {
+                let Ok(offset) =
+                    usize::try_from(inner.buf.len() as kernel::bindings::loff_t + offset)
+                else {
+                    return Err(EINVAL);
+                };
+                if inner.buf.len() >= offset {
+                    Ok(offset)
+                } else {
+                    Err(EINVAL)
+                }
+            }
+            Whence::SeekHole => Ok(inner.buf.len()),
+        }
+    }
+
+    fn lock_buf_inner(&self) -> Result<Guard<'_, Option<SharedRamInnner>, MutexBackend>> {
+        if !INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(EBUSY);
+        }
+        let data = unsafe { self.data.get().as_ref().unwrap() };
+        let Some(data_present) = data else {
+            return Err(EBUSY);
+        };
+        let shared_ram = data_present.lock();
+        Ok(shared_ram)
+    }
 }
 
 struct SharedRamInnner {
@@ -144,6 +191,7 @@ const POPS: ProcOps = ProcOpsBuilder::new(0)
     .with_open(proc_open)
     .with_read(proc_read)
     .with_write(proc_write)
+    .with_lseek(proc_lseek)
     .into_proc_ops();
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -178,10 +226,17 @@ impl Drop for RustProcRamFile {
 }
 
 unsafe extern "C" fn proc_open(
-    inode: *mut kernel::bindings::inode,
+    _inode: *mut kernel::bindings::inode,
     file: *mut kernel::bindings::file,
 ) -> i32 {
-    unsafe { kernel::proc_fs::nonseekable_open(inode, file) }
+    unsafe {
+        pr_info!(
+            "Opened file with mode={:o} append={}",
+            (*file).f_mode,
+            ((*file).f_mode & kernel::bindings::O_APPEND) != 0
+        );
+    }
+    0
 }
 
 unsafe extern "C" fn proc_read(
@@ -256,4 +311,38 @@ unsafe extern "C" fn proc_write(
         return EINVAL.to_errno() as isize;
     };
     ret
+}
+
+unsafe extern "C" fn proc_lseek(
+    file: *mut kernel::bindings::file,
+    offset: kernel::bindings::loff_t,
+    whence: core::ffi::c_int,
+) -> kernel::bindings::loff_t {
+    let Ok(whence_u32) = u32::try_from(whence) else {
+        return EINVAL.to_errno().into();
+    };
+    let Ok(whence) = Whence::try_from(whence_u32) else {
+        return EINVAL.to_errno().into();
+    };
+    let file_ref = unsafe {
+        let Some(file_ref) = file.as_ref() else {
+            return EINVAL.to_errno().into();
+        };
+        file_ref
+    };
+    let off = match FILE_DATA.lseek(file_ref.f_pos, offset, whence) {
+        core::result::Result::Ok(offs) => offs,
+        core::result::Result::Err(e) => {
+            return e.to_errno().into();
+        }
+    };
+    pr_info!(
+        "Seek pos={}, offset={offset}, next_off={off}",
+        file_ref.f_pos
+    );
+    let Ok(output) = kernel::bindings::loff_t::try_from(off) else {
+        // Todo: Should be EOVERFLOW afaik
+        return EINVAL.to_errno().into();
+    };
+    output
 }

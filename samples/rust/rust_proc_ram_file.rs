@@ -60,17 +60,18 @@ impl SharedRamFile {
         }
     }
 
-    fn write(&self, user: UserSlice, offset: usize) -> Result<usize> {
+    fn write(&self, user: UserSlice, offset: Option<usize>) -> Result<usize> {
         let mut shared_ram = self.lock_buf_inner()?;
         let Some(inner) = shared_ram.as_mut() else {
             return Err(EBUSY);
         };
         let buf = user.reader();
         let len = buf.len();
-        pr_info!("Wants write {len} bytes, offset={offset}\n");
+        pr_info!("Wants write {len} bytes, offset={offset:?}\n");
 
         let cur: &mut alloc::vec::Vec<u8> = &mut inner.buf;
-        if offset == 0 || offset == len {
+        let offset = offset.unwrap_or_else(|| cur.len());
+        if offset == 0 {
             pr_info!(
                 "Wants write {len} bytes from start into vec: {:p} with cap={}, len={}\n",
                 cur.as_ptr(),
@@ -78,7 +79,6 @@ impl SharedRamFile {
                 cur.len(),
             );
             cur.clear();
-            cur.reserve(len, GFP_KERNEL)?;
             pr_info!(
                 "Reserved {len} bytes for write, cur vec at: {:p}\n",
                 cur.as_ptr()
@@ -94,9 +94,7 @@ impl SharedRamFile {
             return Err(EINVAL);
         }
         pr_info!("Wants write {len} bytes from offset={offset}\n");
-        let total_space_needed = offset + len;
         for _byte in cur.drain(offset..) {}
-        cur.reserve(total_space_needed, GFP_KERNEL)?;
         buf.read_all(cur, GFP_KERNEL)?;
         Ok(cur.len())
     }
@@ -199,22 +197,18 @@ static FILE_DATA: SharedRamFile = SharedRamFile::uninit();
 
 impl kernel::Module for RustProcRamFile {
     fn init(_module: &'static ThisModule) -> Result<Self> {
-        pr_info!("Loading rust /proc/rust-proc-file\n");
         let pde = proc_create(c_str!("rust-proc-file"), 0666, None, &POPS)?;
 
         let sri = SharedRamInnner {
             buf: alloc::vec::Vec::new(),
             _pde: pde,
         };
-        pr_info!("Created empty SRI with vec at ptr={:p}\n", sri.buf.as_ptr());
         let lock = kernel::new_mutex!(Some(sri), "proc_ram_mutex");
-        pr_info!("Created new mutex\n");
         let m = Box::pin_init(lock, GFP_KERNEL)?;
-        pr_info!("Initialized new boxed mutex\n");
         unsafe {
             FILE_DATA.init(m);
-            pr_info!("Initialized file data.\n");
         }
+        pr_info!("Loaded /proc/rust-proc-file\n");
         Ok(Self)
     }
 }
@@ -227,16 +221,16 @@ impl Drop for RustProcRamFile {
 
 unsafe extern "C" fn proc_open(
     _inode: *mut kernel::bindings::inode,
-    file: *mut kernel::bindings::file,
+    _file: *mut kernel::bindings::file,
 ) -> i32 {
-    unsafe {
-        pr_info!(
-            "Opened file with mode={:o} append={}",
-            (*file).f_mode,
-            ((*file).f_mode & kernel::bindings::O_APPEND) != 0
-        );
-    }
     0
+}
+
+fn file_is_append(file: *mut kernel::bindings::file) -> Result<bool> {
+    unsafe {
+        let f = file.as_ref().ok_or_else(|| EINVAL)?;
+        Ok(f.f_flags & kernel::bindings::O_APPEND != 0)
+    }
 }
 
 unsafe extern "C" fn proc_read(
@@ -277,7 +271,7 @@ unsafe extern "C" fn proc_read(
 }
 
 unsafe extern "C" fn proc_write(
-    _file: *mut kernel::bindings::file,
+    file: *mut kernel::bindings::file,
     buf: *const core::ffi::c_char,
     buf_cap: usize,
     write_offset: *mut kernel::bindings::loff_t,
@@ -292,6 +286,18 @@ unsafe extern "C" fn proc_write(
     };
     let Ok(offset) = usize::try_from(*offset) else {
         return EINVAL.to_errno() as isize;
+    };
+    let offset = match file_is_append(file) {
+        Ok(is_append) => {
+            if is_append {
+                None
+            } else {
+                Some(offset)
+            }
+        }
+        Err(e) => {
+            return e.to_errno() as isize;
+        }
     };
     let next_offset = FILE_DATA.write(user_buf, offset);
     let next_offset = match next_offset {

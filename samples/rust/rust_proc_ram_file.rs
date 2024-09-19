@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 
 //! Rust simple proc file example.
+//! The module creates a file under `/proc/rust-proc-file` which functions similarly to a regular
+//! file, backed by a memory buffer contained in this module.
+//!
+//! It's read, write, seekable, appendable by anyone by default
 
 use core::{mem::MaybeUninit, option::Option, sync::atomic::Ordering};
 
@@ -22,22 +26,39 @@ module! {
 
 struct RustProcRamFile;
 
-static INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+mod backing_data {
+    use kernel::sync::lock::{mutex::MutexBackend, Lock};
 
-fn is_initialized() -> bool {
-    INITIALIZED.load(Ordering::Acquire)
+    use super::*;
+    static INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// Initialize the backing data of this module, letting new
+    /// users access it.
+    /// # Safety
+    /// Safe if only called once during the module's lifetime
+    pub(super) unsafe fn init(
+        lock_ready: impl PinInit<Lock<Option<SharedRamInnner>, MutexBackend>>,
+    ) -> Result<()> {
+        unsafe {
+            let slot = MAYBE_UNUNIT_DATA_SLOT.as_mut_ptr();
+            lock_ready.__pinned_init(slot)?;
+        }
+        INITIALIZED.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    static mut MAYBE_UNUNIT_DATA_SLOT: MaybeUninit<Mutex<Option<SharedRamInnner>>> =
+        MaybeUninit::uninit();
+
+    pub(super) fn get_data_if_init() -> Result<&'static Mutex<Option<SharedRamInnner>>> {
+        if INITIALIZED.load(Ordering::Acquire) {
+            // Safety: If this has ever been initialized
+            unsafe { Ok(MAYBE_UNUNIT_DATA_SLOT.assume_init_ref()) }
+        } else {
+            Err(EBUSY)
+        }
+    }
 }
-
-fn set_init() {
-    INITIALIZED.store(true, Ordering::Release);
-}
-
-fn set_uninit() {
-    INITIALIZED.store(false, Ordering::Release);
-}
-
-static mut MAYBE_UNUNIT_DATA_SLOT: MaybeUninit<Mutex<Option<SharedRamInnner>>> =
-    MaybeUninit::uninit();
 
 const POPS: ProcOps<'static, ProcHand> = ProcOps::<'static, ProcHand>::new(0);
 
@@ -51,10 +72,9 @@ impl kernel::Module for RustProcRamFile {
         };
         let lock = kernel::new_mutex!(Some(sri), "proc_ram_mutex");
         unsafe {
-            let slot = MAYBE_UNUNIT_DATA_SLOT.as_mut_ptr();
-            lock.__pinned_init(slot)?;
+            // Safety: Only place this is called
+            backing_data::init(lock)?;
         }
-        set_init();
         pr_info!("Loaded /proc/rust-proc-file\n");
         Ok(Self)
     }
@@ -62,10 +82,10 @@ impl kernel::Module for RustProcRamFile {
 
 impl Drop for RustProcRamFile {
     fn drop(&mut self) {
-        // Any new readers will bounce after this toggle
-        set_uninit();
-        let data_owned = unsafe { MAYBE_UNUNIT_DATA_SLOT.assume_init_ref() };
-        data_owned.lock().take();
+        // Drop the data if initialized
+        if let Ok(data) = backing_data::get_data_if_init() {
+            data.lock().take();
+        }
         // There is theoretically a race-condition, where module-users are currently in a
         // proc handler, the handler itself is 'static, so the kernel will be trusted
         // to keep function-related memory initialized until it's no longer needed.
@@ -79,10 +99,7 @@ impl Drop for RustProcRamFile {
 }
 
 fn with_data<T, F: FnOnce(&mut SharedRamInnner) -> Result<T>>(func: F) -> Result<T> {
-    if !is_initialized() {
-        return Err(EBUSY);
-    }
-    let value = unsafe { MAYBE_UNUNIT_DATA_SLOT.assume_init_ref() };
+    let value = backing_data::get_data_if_init()?;
     let mut guard = value.lock();
     if let Some(inner) = guard.as_mut() {
         (func)(inner)

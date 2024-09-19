@@ -33,18 +33,18 @@ pub trait ProcHandler<'a> {
     const LSEEK: ProcLseek<'a>;
 }
 
-/// Todo: linux doc link
+/// lseek valid variants [See the lseek docs for more detail](https://man7.org/linux/man-pages/man2/lseek.2.html)
 #[repr(u32)]
 pub enum Whence {
-    /// Todo
+    /// See above doc link
     SeekSet = kernel::bindings::SEEK_SET,
-    /// Todo
+    /// See above doc link
     SeekCur = kernel::bindings::SEEK_CUR,
-    /// Todo
+    /// See above doc link
     SeekEnd = kernel::bindings::SEEK_END,
-    /// Todo
+    /// See above doc link
     SeekData = kernel::bindings::SEEK_DATA,
-    /// Todo
+    /// See above doc link
     SeekHole = kernel::bindings::SEEK_HOLE,
 }
 
@@ -63,7 +63,9 @@ impl TryFrom<u32> for Whence {
     }
 }
 
-/// Usable wrapper for proc ops
+/// Wrapper for the kernel type `proc_ops`
+/// Roughly a translation of the expected `extern "C"`-function pointers that
+/// the kernel expects into Rust-functions with a few more helpful types.
 pub struct ProcOps<'a, T>
 where
     T: ProcHandler<'a>,
@@ -100,9 +102,6 @@ where
         file: *mut kernel::bindings::file,
     ) -> i32 {
         unsafe {
-            // Todo: This is likely a UB-risk, need a better abstraction than
-            // casting this as a mutable reference, since it's unknown what else
-            // in the kernel may be mutably referencing this.
             let Some(inode_ref) = inode.as_ref() else {
                 return EINVAL.to_errno();
             };
@@ -142,7 +141,7 @@ where
             // Todo: Double check this conversion, only 'safe' if in large file mode
             Ok((read_bytes, next_offset)) => {
                 unsafe {
-                    read_offset.write(next_offset as i64);
+                    read_offset.write(next_offset as kernel::bindings::loff_t);
                 }
                 read_bytes as isize
             }
@@ -210,6 +209,7 @@ where
 }
 
 /// A proc directory entry.
+/// When drop, the directory is removed.  
 pub struct ProcDirEntry<'a> {
     ptr: core::ptr::NonNull<bindings::proc_dir_entry>,
     _pd: core::marker::PhantomData<&'a ()>,
@@ -223,16 +223,15 @@ impl<'a> Drop for ProcDirEntry<'a> {
     }
 }
 
-/// Nonseekable open
+/// Nonseekable open, required if not implementing `lseek`
 #[inline]
 pub fn rust_nonseekable(i: &mut inode, f: &mut file) -> Result<i32> {
-    unsafe { Ok(nonseekable_open(i as *mut inode, f as *mut file)) }
-}
-
-/// Open as nonseekable, can be used as part of a supplied `unsafe extern "C"` `proc_open`
-#[inline]
-pub unsafe extern "C" fn nonseekable_open(inode: *mut inode, file: *mut file) -> i32 {
-    unsafe { bindings::nonseekable_open(inode, file) }
+    unsafe {
+        Ok(kernel::bindings::nonseekable_open(
+            i as *mut inode,
+            f as *mut file,
+        ))
+    }
 }
 
 /// Create a proc entry with the filename `name`

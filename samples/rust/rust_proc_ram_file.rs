@@ -95,6 +95,7 @@ impl Drop for RustProcRamFile {
         // the proc-entry can't happen atomically together. It's impossible to ensure that there
         // isn't a gap between a user entering the proc-handler, then recording its presense, and
         // removing the proc-entry and checking if the user registered.
+        // In that case, the user will get an EBUSY
     }
 }
 

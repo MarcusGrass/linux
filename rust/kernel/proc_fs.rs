@@ -68,7 +68,7 @@ impl TryFrom<u32> for Whence {
 /// the kernel expects into Rust-functions with a few more helpful types.
 pub struct ProcOps<'a, T>
 where
-    T: ProcHandler<'a>,
+    T: ProcHandler<'static>,
 {
     ops: bindings::proc_ops,
     _pd: PhantomData<&'a T>,

@@ -94,9 +94,8 @@ impl kernel::Module for RustProcRamFile {
             unsafe fn popen(file: &mut ProcOpFileHandle) -> Result<i32> {
                 unsafe {
                     with_data(|d| {
-                        let f_lock = file.read_locked_ref();
-                        let flags = f_lock.flags_ref();
-                        if *flags & kernel::bindings::O_TRUNC != 0 {
+                        let flags = file.get_flags();
+                        if flags & kernel::bindings::O_TRUNC != 0 {
                             d.clear();
                         }
                         Ok(())
@@ -111,15 +110,14 @@ impl kernel::Module for RustProcRamFile {
             unsafe fn pread(
                 _file: &mut ProcOpFileHandle,
                 mut user_slice: UserSliceWriter,
-                offset: &kernel::bindings::loff_t,
+                offset: kernel::bindings::loff_t,
             ) -> Result<(usize, usize)> {
-                let Ok(offset) = usize::try_from(*offset) else {
+                let Ok(offset) = usize::try_from(offset) else {
                     return Err(EINVAL);
                 };
                 unsafe {
                     with_data(move |inner| {
                         let len = user_slice.len();
-                        pr_info!("Wants read max {len} bytes at offset={offset}\n");
                         let cur: &[u8] = inner.as_slice();
                         let Some(wants_section) = cur.get(offset..) else {
                             // EOF
@@ -142,14 +140,13 @@ impl kernel::Module for RustProcRamFile {
             unsafe fn pwrite(
                 file: &mut ProcOpFileHandle,
                 user_slice_reader: UserSliceReader,
-                offset: &kernel::bindings::loff_t,
+                offset: kernel::bindings::loff_t,
             ) -> Result<(usize, usize)> {
                 let len = user_slice_reader.len();
-                let Ok(offset) = usize::try_from(*offset) else {
+                let Ok(offset) = usize::try_from(offset) else {
                     return Err(EINVAL);
                 };
-                let f_lock = file.read_locked_ref();
-                let offset = if flags_are_append(f_lock.flags_ref()) {
+                let offset = if flags_are_append(file.get_flags()) {
                     None
                 } else {
                     Some(offset)
@@ -158,7 +155,6 @@ impl kernel::Module for RustProcRamFile {
                     with_data(move |cur| {
                         let mut buf = user_slice_reader;
                         let len = buf.len();
-                        pr_info!("Wants write {len} bytes, offset={offset:?}\n");
 
                         let offset = offset.unwrap_or_else(|| cur.len());
                         // Illegal start offset
@@ -194,10 +190,6 @@ impl kernel::Module for RustProcRamFile {
                 offset: kernel::bindings::loff_t,
                 whence: Whence,
             ) -> Result<kernel::bindings::loff_t> {
-                pr_info!("Seek to {offset} whence: {whence:?}");
-                let mut f_lock = file.write_locked_ref();
-                let f_ref = f_lock.pos_mut();
-                let pos = *f_ref;
                 let off = unsafe {
                     with_data(|inner| match whence {
                         Whence::SeekSet | Whence::SeekData => {
@@ -211,7 +203,8 @@ impl kernel::Module for RustProcRamFile {
                             }
                         }
                         Whence::SeekCur => {
-                            let Ok(offset) = usize::try_from(pos + offset) else {
+                            let start_pos = file.read_pos_unsync();
+                            let Ok(offset) = usize::try_from(start_pos + offset) else {
                                 return Err(EINVAL);
                             };
                             if inner.len() >= offset {
@@ -239,7 +232,9 @@ impl kernel::Module for RustProcRamFile {
                     // Todo: Should be EOVERFLOW afaik
                     return Err(EINVAL);
                 };
-                *f_ref = output;
+                unsafe {
+                    file.write_pos_unsync(output);
+                }
                 Ok(output)
             }
         }
@@ -321,6 +316,6 @@ unsafe fn with_data<T, F: FnOnce(&mut alloc::vec::Vec<u8>) -> Result<T>>(func: F
 }
 
 #[inline]
-fn flags_are_append(flags: &core::ffi::c_uint) -> bool {
+fn flags_are_append(flags: core::ffi::c_uint) -> bool {
     flags & kernel::bindings::O_APPEND != 0
 }

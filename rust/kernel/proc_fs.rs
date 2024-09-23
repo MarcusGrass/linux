@@ -16,10 +16,10 @@ use crate::{
 pub type ProcOpen<'a> = &'a dyn Fn(&mut ProcOpFileHandle) -> Result<i32>;
 /// Type alias for read function signature
 pub type ProcRead<'a> =
-    &'a dyn Fn(&mut ProcOpFileHandle, UserSliceWriter, &loff_t) -> Result<(usize, usize)>;
+    &'a dyn Fn(&mut ProcOpFileHandle, UserSliceWriter, loff_t) -> Result<(usize, usize)>;
 /// Type alias for write function signature
 pub type ProcWrite<'a> =
-    &'a dyn Fn(&mut ProcOpFileHandle, UserSliceReader, &loff_t) -> Result<(usize, usize)>;
+    &'a dyn Fn(&mut ProcOpFileHandle, UserSliceReader, loff_t) -> Result<(usize, usize)>;
 /// Type alias for lseek function signature
 pub type ProcLseek<'a> = &'a dyn Fn(&mut ProcOpFileHandle, loff_t, Whence) -> Result<loff_t>;
 
@@ -68,96 +68,55 @@ impl TryFrom<u32> for Whence {
 
 /// A safe wrapper for the kernel's `file`-structure, file contains a lot of
 /// fields which have different synchronization requirements.
-/// Through `inode`-locking and only exposing a few of the `file`'s fields,
-/// this provides a safe subset for reading/writing some select data to/from the `file`
+/// This provides a safer subset for reading/writing some select data to/from the `file`
 pub struct ProcOpFileHandle(core::ptr::NonNull<kernel::bindings::file>);
 
 impl ProcOpFileHandle {
-    fn semaphore_ptr(&self) -> core::ptr::NonNull<kernel::bindings::rw_semaphore> {
+    /// Gets the file flags
+    pub fn get_flags(&self) -> core::ffi::c_uint {
         unsafe {
-            let inode_offs = offset_of!(kernel::bindings::file, f_inode);
-            let inode = self
-                .0
+            // Safety: flags are only set on open, any time
+            // code gets here it's not going to be modified anymore
+            let flags_offset = offset_of!(kernel::bindings::file, f_flags);
+            self.0
                 .cast::<u8>()
-                .add(inode_offs)
-                .cast::<kernel::bindings::inode>();
-            let inode_rw_offs = offset_of!(kernel::bindings::inode, i_rwsem);
-            let inode_rw_sem_ptr = inode
+                .add(flags_offset)
+                .cast::<core::ffi::c_uint>()
+                .read()
+        }
+    }
+
+    fn pos_ptr(&self) -> core::ptr::NonNull<kernel::bindings::loff_t> {
+        unsafe {
+            let pos_offset = offset_of!(kernel::bindings::file, f_pos);
+            self.0
                 .cast::<u8>()
-                .add(inode_rw_offs)
-                .cast::<kernel::bindings::rw_semaphore>();
-            inode_rw_sem_ptr
+                .add(pos_offset)
+                .cast::<kernel::bindings::loff_t>()
         }
     }
 
-    /// Get a read-locked guard for the kernel `file`-structure
-    pub fn read_locked_ref(&mut self) -> FilePtrReadLocked<'_> {
+    /// Reading the position is inescapably subject to raciness.  
+    /// The kernel will, on this file-pointer, update position after each read and write,
+    /// see ksys_read, ksys_write at read_write.c.  
+    /// If the file is opened with f_mode `FMODE_ATOMIC_POS`, the proc-function is run under
+    /// a pos-lock if needed, in which case this is safe from data-races.  
+    /// Which means its up to the user to make sure concurrent read-writes doesn't happen if
+    /// they want the offset to make sense.
+    /// # Safety:
+    /// This number may or may not make any sense, bounds checking is still necessary
+    /// to retain safety
+    pub unsafe fn read_pos_unsync(&self) -> kernel::bindings::loff_t {
+        unsafe { self.pos_ptr().read() }
+    }
+
+    /// Same raciness problems as [`Self::read_pos_unsync`].
+    /// # Safety:
+    /// This number may or may not make any sense, bounds checking is still necessary
+    /// to retain safety
+    pub unsafe fn write_pos_unsync(&self, offset: loff_t) {
         unsafe {
-            let sem = self.semaphore_ptr();
-            kernel::bindings::down_read(sem.as_ptr());
-            FilePtrReadLocked {
-                f_ref: self,
-                semaphore: sem,
-            }
-        }
-    }
-
-    /// Get a write-locked guard for the kernel `file`-structure
-    pub fn write_locked_ref(&mut self) -> FilePtrWriteLocked<'_> {
-        unsafe {
-            let sem = self.semaphore_ptr();
-            kernel::bindings::down_write(sem.as_ptr());
-            FilePtrWriteLocked {
-                f_ref: self,
-                semaphore: sem,
-            }
-        }
-    }
-}
-
-/// A read-locked guard which exposes a few of the `file`-structure's fields
-pub struct FilePtrReadLocked<'a> {
-    f_ref: &'a ProcOpFileHandle,
-    semaphore: core::ptr::NonNull<kernel::bindings::rw_semaphore>,
-}
-
-impl<'a> FilePtrReadLocked<'a> {
-    /// Borrow an immutable reference to the `file`-structure's offset (inode read-locked)
-    pub fn pos_ref(&self) -> &kernel::bindings::loff_t {
-        unsafe { &self.f_ref.0.as_ref().f_pos }
-    }
-
-    /// Borrow an immutable reference to the `file`-structure's flags (inode read-locked)
-    pub fn flags_ref(&self) -> &core::ffi::c_uint {
-        unsafe { &self.f_ref.0.as_ref().f_flags }
-    }
-}
-
-impl<'a> Drop for FilePtrReadLocked<'a> {
-    fn drop(&mut self) {
-        unsafe {
-            kernel::bindings::up_read(self.semaphore.as_ptr());
-        }
-    }
-}
-
-/// A write-locked guard which exposes a few of the `file`-structure's fields modifiably
-pub struct FilePtrWriteLocked<'a> {
-    f_ref: &'a mut ProcOpFileHandle,
-    semaphore: core::ptr::NonNull<kernel::bindings::rw_semaphore>,
-}
-
-impl<'a> FilePtrWriteLocked<'a> {
-    /// Borrow a mutable reference to the file structure's offset (inode write-locked)
-    pub fn pos_mut(&mut self) -> &mut kernel::bindings::loff_t {
-        unsafe { &mut self.f_ref.0.as_mut().f_pos }
-    }
-}
-
-impl<'a> Drop for FilePtrWriteLocked<'a> {
-    fn drop(&mut self) {
-        unsafe {
-            kernel::bindings::up_write(self.semaphore.as_ptr());
+            self.pos_ptr().write(offset);
         }
     }
 }
@@ -224,17 +183,16 @@ where
         let buf = buf as *mut u8 as usize;
         let buf_ref = UserSlice::new(buf, buf_cap);
         let buf_writer = buf_ref.writer();
-        let offset = unsafe {
-            let Some(offset_ref) = read_offset.as_mut() else {
-                return EINVAL.to_errno() as isize;
-            };
-            offset_ref
+        let Some(offset_non_null) = core::ptr::NonNull::new(read_offset) else {
+            // Only null if stream, unsupported
+            return EINVAL.to_errno() as isize;
         };
+        let offset = unsafe { offset_non_null.read() };
         match (T::READ)(&mut file_ref, buf_writer, offset) {
             // Todo: Double check this conversion, only 'safe' if in large file mode
             Ok((read_bytes, next_offset)) => {
                 unsafe {
-                    read_offset.write(next_offset as kernel::bindings::loff_t);
+                    offset_non_null.write(next_offset as kernel::bindings::loff_t);
                 }
                 read_bytes as isize
             }
@@ -257,18 +215,17 @@ where
         let buf = buf as *mut u8 as usize;
         let buf_ref = UserSlice::new(buf, buf_cap);
         let buf_writer = buf_ref.reader();
-        let offset = unsafe {
-            let Some(offset_ref) = write_offset.as_mut() else {
-                return EINVAL.to_errno() as isize;
-            };
-            offset_ref
+        let Some(offset_non_null) = core::ptr::NonNull::new(write_offset) else {
+            // Only null if opened as a stream, unsupported
+            return EINVAL.to_errno() as isize;
         };
+        let offset = unsafe { offset_non_null.read() };
 
         match (T::WRITE)(&mut file_ref, buf_writer, offset) {
             // Todo: Double check this conversion, only 'safe' if in large file mode
             Ok((written_bytes, next_offset)) => {
                 unsafe {
-                    write_offset.write(next_offset as i64);
+                    offset_non_null.write(next_offset as i64);
                 }
                 written_bytes as isize
             }

@@ -11,7 +11,7 @@ use core::{mem::MaybeUninit, option::Option};
 use kernel::{
     c_str,
     prelude::*,
-    proc_fs::{proc_create, ProcDirEntry, ProcHandler, ProcOps, Whence},
+    proc_fs::{proc_create, ProcDirEntry, ProcHandler, ProcOpFileHandle, ProcOps, Whence},
     sync::Mutex,
     uaccess::{UserSliceReader, UserSliceWriter},
 };
@@ -91,10 +91,7 @@ impl kernel::Module for RustProcRamFile {
 
         impl ProcHand {
             #[inline]
-            fn popen(
-                _inode: &kernel::bindings::inode,
-                _file: &kernel::bindings::file,
-            ) -> Result<i32> {
+            fn popen(_file: &mut ProcOpFileHandle) -> Result<i32> {
                 Ok(0)
             }
 
@@ -102,7 +99,7 @@ impl kernel::Module for RustProcRamFile {
             /// # Safety
             /// Safe only if run as part of this module's process handler
             unsafe fn pread(
-                _file: &kernel::bindings::file,
+                _file: &mut ProcOpFileHandle,
                 mut user_slice: UserSliceWriter,
                 offset: &kernel::bindings::loff_t,
             ) -> Result<(usize, usize)> {
@@ -133,7 +130,7 @@ impl kernel::Module for RustProcRamFile {
             /// # Safety
             /// Safe only if run as part of this module's process handler
             unsafe fn pwrite(
-                file: &kernel::bindings::file,
+                file: &mut ProcOpFileHandle,
                 user_slice_reader: UserSliceReader,
                 offset: &kernel::bindings::loff_t,
             ) -> Result<(usize, usize)> {
@@ -141,11 +138,13 @@ impl kernel::Module for RustProcRamFile {
                 let Ok(offset) = usize::try_from(*offset) else {
                     return Err(EINVAL);
                 };
-                let offset = if file_is_append(file) {
+                let f_lock = file.read_locked_ref();
+                let offset = if flags_are_append(f_lock.flags_ref()) {
                     None
                 } else {
                     Some(offset)
                 };
+                drop(f_lock);
                 let next_offset = unsafe {
                     with_data(move |cur| {
                         let buf = user_slice_reader;
@@ -189,10 +188,14 @@ impl kernel::Module for RustProcRamFile {
             /// # Safety
             /// Safe only if run as part of this module's process handler
             unsafe fn plseek(
-                file: &kernel::bindings::file,
+                file: &mut ProcOpFileHandle,
                 offset: kernel::bindings::loff_t,
                 whence: Whence,
             ) -> Result<kernel::bindings::loff_t> {
+                pr_info!("Seek to {offset} whence: {whence:?}");
+                let mut f_lock = file.write_locked_ref();
+                let f_ref = f_lock.pos_mut();
+                let pos = *f_ref;
                 let off = unsafe {
                     with_data(|inner| match whence {
                         Whence::SeekSet | Whence::SeekData => {
@@ -206,7 +209,7 @@ impl kernel::Module for RustProcRamFile {
                             }
                         }
                         Whence::SeekCur => {
-                            let Ok(offset) = usize::try_from(file.f_pos + offset) else {
+                            let Ok(offset) = usize::try_from(pos + offset) else {
                                 return Err(EINVAL);
                             };
                             if inner.len() >= offset {
@@ -234,6 +237,7 @@ impl kernel::Module for RustProcRamFile {
                     // Todo: Should be EOVERFLOW afaik
                     return Err(EINVAL);
                 };
+                *f_ref = output;
                 Ok(output)
             }
         }
@@ -315,6 +319,6 @@ unsafe fn with_data<T, F: FnOnce(&mut alloc::vec::Vec<u8>) -> Result<T>>(func: F
 }
 
 #[inline]
-fn file_is_append(file: &kernel::bindings::file) -> bool {
-    file.f_flags & kernel::bindings::O_APPEND != 0
+fn flags_are_append(flags: &core::ffi::c_uint) -> bool {
+    flags & kernel::bindings::O_APPEND != 0
 }

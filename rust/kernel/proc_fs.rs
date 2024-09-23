@@ -1,7 +1,7 @@
 //! Implementation of proc_fs functionality
 //!
 
-use core::{marker::PhantomData, option::Option};
+use core::{marker::PhantomData, mem::offset_of, option::Option};
 
 use bindings::{file, inode, loff_t, proc_ops};
 
@@ -13,13 +13,15 @@ use crate::{
 };
 
 /// Type alias for open function signature
-pub type ProcOpen<'a> = &'a dyn Fn(&inode, &file) -> Result<i32>;
+pub type ProcOpen<'a> = &'a dyn Fn(&mut ProcOpFileHandle) -> Result<i32>;
 /// Type alias for read function signature
-pub type ProcRead<'a> = &'a dyn Fn(&file, UserSliceWriter, &loff_t) -> Result<(usize, usize)>;
+pub type ProcRead<'a> =
+    &'a dyn Fn(&mut ProcOpFileHandle, UserSliceWriter, &loff_t) -> Result<(usize, usize)>;
 /// Type alias for write function signature
-pub type ProcWrite<'a> = &'a dyn Fn(&file, UserSliceReader, &loff_t) -> Result<(usize, usize)>;
+pub type ProcWrite<'a> =
+    &'a dyn Fn(&mut ProcOpFileHandle, UserSliceReader, &loff_t) -> Result<(usize, usize)>;
 /// Type alias for lseek function signature
-pub type ProcLseek<'a> = &'a dyn Fn(&file, loff_t, Whence) -> Result<loff_t>;
+pub type ProcLseek<'a> = &'a dyn Fn(&mut ProcOpFileHandle, loff_t, Whence) -> Result<loff_t>;
 
 /// Proc file ops handler
 pub trait ProcHandler<'a> {
@@ -35,6 +37,7 @@ pub trait ProcHandler<'a> {
 
 /// lseek valid variants [See the lseek docs for more detail](https://man7.org/linux/man-pages/man2/lseek.2.html)
 #[repr(u32)]
+#[derive(Copy, Clone, Debug)]
 pub enum Whence {
     /// See above doc link
     SeekSet = kernel::bindings::SEEK_SET,
@@ -63,6 +66,102 @@ impl TryFrom<u32> for Whence {
     }
 }
 
+/// A safe wrapper for the kernel's `file`-structure, file contains a lot of
+/// fields which have different synchronization requirements.
+/// Through `inode`-locking and only exposing a few of the `file`'s fields,
+/// this provides a safe subset for reading/writing some select data to/from the `file`
+pub struct ProcOpFileHandle(core::ptr::NonNull<kernel::bindings::file>);
+
+impl ProcOpFileHandle {
+    fn semaphore_ptr(&self) -> core::ptr::NonNull<kernel::bindings::rw_semaphore> {
+        unsafe {
+            let inode_offs = offset_of!(kernel::bindings::file, f_inode);
+            let inode = self
+                .0
+                .cast::<u8>()
+                .add(inode_offs)
+                .cast::<kernel::bindings::inode>();
+            let inode_rw_offs = offset_of!(kernel::bindings::inode, i_rwsem);
+            let inode_rw_sem_ptr = inode
+                .cast::<u8>()
+                .add(inode_rw_offs)
+                .cast::<kernel::bindings::rw_semaphore>();
+            inode_rw_sem_ptr
+        }
+    }
+
+    /// Get a read-locked guard for the kernel `file`-structure
+    pub fn read_locked_ref(&mut self) -> FilePtrReadLocked<'_> {
+        unsafe {
+            let sem = self.semaphore_ptr();
+            kernel::bindings::down_read(sem.as_ptr());
+            FilePtrReadLocked {
+                f_ref: self,
+                semaphore: sem,
+            }
+        }
+    }
+
+    /// Get a write-locked guard for the kernel `file`-structure
+    pub fn write_locked_ref(&mut self) -> FilePtrWriteLocked<'_> {
+        unsafe {
+            let sem = self.semaphore_ptr();
+            kernel::bindings::down_write(sem.as_ptr());
+            FilePtrWriteLocked {
+                f_ref: self,
+                semaphore: sem,
+            }
+        }
+    }
+}
+
+/// A read-locked guard which exposes a few of the `file`-structure's fields
+pub struct FilePtrReadLocked<'a> {
+    f_ref: &'a ProcOpFileHandle,
+    semaphore: core::ptr::NonNull<kernel::bindings::rw_semaphore>,
+}
+
+impl<'a> FilePtrReadLocked<'a> {
+    /// Borrow an immutable reference to the `file`-structure's offset (inode read-locked)
+    pub fn pos_ref(&self) -> &kernel::bindings::loff_t {
+        unsafe { &self.f_ref.0.as_ref().f_pos }
+    }
+
+    /// Borrow an immutable reference to the `file`-structure's flags (inode read-locked)
+    pub fn flags_ref(&self) -> &core::ffi::c_uint {
+        unsafe { &self.f_ref.0.as_ref().f_flags }
+    }
+}
+
+impl<'a> Drop for FilePtrReadLocked<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            kernel::bindings::up_read(self.semaphore.as_ptr());
+        }
+    }
+}
+
+/// A write-locked guard which exposes a few of the `file`-structure's fields modifiably
+pub struct FilePtrWriteLocked<'a> {
+    f_ref: &'a mut ProcOpFileHandle,
+    semaphore: core::ptr::NonNull<kernel::bindings::rw_semaphore>,
+}
+
+impl<'a> FilePtrWriteLocked<'a> {
+    /// Borrow a mutable reference to the file structure's offset (inode write-locked)
+    pub fn pos_mut(&mut self) -> &mut kernel::bindings::loff_t {
+        unsafe { &mut self.f_ref.0.as_mut().f_pos }
+    }
+}
+
+impl<'a> Drop for FilePtrWriteLocked<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            kernel::bindings::up_write(self.semaphore.as_ptr());
+        }
+    }
+}
+
 /// Wrapper for the kernel type `proc_ops`
 /// Roughly a translation of the expected `extern "C"`-function pointers that
 /// the kernel expects into Rust-functions with a few more helpful types.
@@ -75,7 +174,7 @@ where
 }
 impl<'a, T> ProcOps<'a, T>
 where
-    T: ProcHandler<'a>,
+    T: ProcHandler<'static>,
 {
     /// Create new ProcOps from a handler and flags
     pub const fn new(proc_flags: u32) -> Self {
@@ -98,20 +197,17 @@ where
         }
     }
     unsafe extern "C" fn proc_open(
-        inode: *mut kernel::bindings::inode,
+        _inode: *mut kernel::bindings::inode,
         file: *mut kernel::bindings::file,
     ) -> i32 {
-        unsafe {
-            let Some(inode_ref) = inode.as_ref() else {
-                return EINVAL.to_errno();
-            };
-            let Some(file_ref) = file.as_ref() else {
-                return EINVAL.to_errno();
-            };
-            match (T::OPEN)(inode_ref, file_ref) {
-                Ok(code) => code,
-                Err(e) => e.to_errno(),
-            }
+        let mut file_ref = if let Some(ptr) = core::ptr::NonNull::new(file) {
+            ProcOpFileHandle(ptr)
+        } else {
+            return EINVAL.to_errno() as i32;
+        };
+        match (T::OPEN)(&mut file_ref) {
+            Ok(code) => code,
+            Err(e) => e.to_errno(),
         }
     }
     unsafe extern "C" fn proc_read(
@@ -120,13 +216,10 @@ where
         buf_cap: usize,
         read_offset: *mut kernel::bindings::loff_t,
     ) -> isize {
-        let file_ref = unsafe {
-            match file.as_ref() {
-                Some(f) => f,
-                None => {
-                    return EINVAL.to_errno() as isize;
-                }
-            }
+        let mut file_ref = if let Some(ptr) = core::ptr::NonNull::new(file) {
+            ProcOpFileHandle(ptr)
+        } else {
+            return EINVAL.to_errno() as isize;
         };
         let buf = buf as *mut u8 as usize;
         let buf_ref = UserSlice::new(buf, buf_cap);
@@ -137,7 +230,7 @@ where
             };
             offset_ref
         };
-        match (T::READ)(file_ref, buf_writer, offset) {
+        match (T::READ)(&mut file_ref, buf_writer, offset) {
             // Todo: Double check this conversion, only 'safe' if in large file mode
             Ok((read_bytes, next_offset)) => {
                 unsafe {
@@ -148,20 +241,19 @@ where
             Err(e) => e.to_errno() as isize,
         }
     }
+
     unsafe extern "C" fn proc_write(
         file: *mut kernel::bindings::file,
         buf: *const core::ffi::c_char,
         buf_cap: usize,
         write_offset: *mut kernel::bindings::loff_t,
     ) -> isize {
-        let file_ref = unsafe {
-            match file.as_ref() {
-                Some(f) => f,
-                None => {
-                    return EINVAL.to_errno() as isize;
-                }
-            }
+        let mut file_ref = if let Some(ptr) = core::ptr::NonNull::new(file) {
+            ProcOpFileHandle(ptr)
+        } else {
+            return EINVAL.to_errno() as isize;
         };
+
         let buf = buf as *mut u8 as usize;
         let buf_ref = UserSlice::new(buf, buf_cap);
         let buf_writer = buf_ref.reader();
@@ -171,7 +263,8 @@ where
             };
             offset_ref
         };
-        match (T::WRITE)(file_ref, buf_writer, offset) {
+
+        match (T::WRITE)(&mut file_ref, buf_writer, offset) {
             // Todo: Double check this conversion, only 'safe' if in large file mode
             Ok((written_bytes, next_offset)) => {
                 unsafe {
@@ -193,13 +286,12 @@ where
         let Ok(whence) = Whence::try_from(whence_u32) else {
             return EINVAL.to_errno().into();
         };
-        let file_ref = unsafe {
-            let Some(file_ref) = file.as_ref() else {
-                return EINVAL.to_errno().into();
-            };
-            file_ref
+        let mut file_ref = if let Some(ptr) = core::ptr::NonNull::new(file) {
+            ProcOpFileHandle(ptr)
+        } else {
+            return EINVAL.to_errno().into();
         };
-        match (T::LSEEK)(file_ref, offset, whence) {
+        match (T::LSEEK)(&mut file_ref, offset, whence) {
             core::result::Result::Ok(offs) => offs,
             core::result::Result::Err(e) => {
                 return e.to_errno().into();
@@ -242,7 +334,7 @@ pub fn proc_create<'a, T>(
     proc_ops: &'a ProcOps<'a, T>,
 ) -> Result<ProcDirEntry<'a>>
 where
-    T: ProcHandler<'a>,
+    T: ProcHandler<'static>,
 {
     let pops = core::ptr::addr_of!(proc_ops.ops);
     let pde = unsafe {

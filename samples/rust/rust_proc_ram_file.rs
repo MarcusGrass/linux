@@ -91,7 +91,17 @@ impl kernel::Module for RustProcRamFile {
 
         impl ProcHand {
             #[inline]
-            fn popen(_file: &mut ProcOpFileHandle) -> Result<i32> {
+            unsafe fn popen(file: &mut ProcOpFileHandle) -> Result<i32> {
+                unsafe {
+                    with_data(|d| {
+                        let f_lock = file.read_locked_ref();
+                        let flags = f_lock.flags_ref();
+                        if *flags & kernel::bindings::O_TRUNC != 0 {
+                            d.clear();
+                        }
+                        Ok(())
+                    })?;
+                }
                 Ok(0)
             }
 
@@ -144,40 +154,32 @@ impl kernel::Module for RustProcRamFile {
                 } else {
                     Some(offset)
                 };
-                drop(f_lock);
                 let next_offset = unsafe {
                     with_data(move |cur| {
-                        let buf = user_slice_reader;
+                        let mut buf = user_slice_reader;
                         let len = buf.len();
                         pr_info!("Wants write {len} bytes, offset={offset:?}\n");
 
                         let offset = offset.unwrap_or_else(|| cur.len());
-                        if offset == 0 {
-                            pr_info!(
-                                "Wants write {len} bytes from start into vec: {:p} with cap={}, len={}\n",
-                                cur.as_ptr(),
-                                cur.capacity(),
-                                cur.len(),
-                            );
-                            cur.clear();
-                            pr_info!(
-                                "Reserved {len} bytes for write, cur vec at: {:p}\n",
-                                cur.as_ptr()
-                            );
-                            buf.read_all(cur, GFP_KERNEL)?;
-                            pr_info!(
-                                "Wrote {len} bytes from start, currently has {} bytes\n",
-                                cur.len()
-                            );
-                            return Ok(cur.len());
-                        }
+                        // Illegal start offset
                         if offset > cur.len() {
                             return Err(EINVAL);
                         }
-                        pr_info!("Wants write {len} bytes from offset={offset}\n");
-                        for _byte in cur.drain(offset..) {}
-                        buf.read_all(cur, GFP_KERNEL)?;
-                        Ok(cur.len())
+                        // Append
+                        if offset == cur.len() {
+                            buf.read_all(cur, GFP_KERNEL)?;
+                            return Ok(cur.len());
+                        }
+                        if len + offset > cur.len() {
+                            // Needs more space, first write into the space available, then extend
+                            buf.read_slice(&mut cur.as_mut_slice()[offset..])?;
+                            buf.read_all(cur, GFP_KERNEL)?;
+                            Ok(cur.len())
+                        } else {
+                            // Has enough space, overwrite the wanted section
+                            buf.read_slice(&mut cur.as_mut_slice()[offset..offset + len])?;
+                            Ok(offset + len)
+                        }
                     })?
                 };
 
@@ -253,7 +255,7 @@ impl kernel::Module for RustProcRamFile {
         // `init_data` has been called, but could theoretically be invoked in a safe context before
         // then, so don't, it's ordered like this for a reason.
         impl ProcHandler<'static> for ProcHand {
-            const OPEN: kernel::proc_fs::ProcOpen<'static> = &Self::popen;
+            const OPEN: kernel::proc_fs::ProcOpen<'static> = &|f| unsafe { Self::popen(f) };
 
             const READ: kernel::proc_fs::ProcRead<'static> =
                 &|f, u, o| unsafe { Self::pread(f, u, o) };

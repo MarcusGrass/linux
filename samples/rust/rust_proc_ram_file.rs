@@ -90,7 +90,6 @@ impl kernel::Module for RustProcRamFile {
         struct ProcHand;
 
         impl ProcHand {
-            #[inline]
             unsafe fn popen(file: &mut ProcOpFileHandle) -> Result<i32> {
                 unsafe {
                     with_data(|d| {
